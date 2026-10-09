@@ -1,26 +1,48 @@
 const directory = {
-  "L1": { name: "Vito, Dag John Paul M.", type: "Student" },
+  "L1": { name: "Vitto, Dag Johny Phol M.", type: "Student" },
   "L2": { name: "Pineda, Christian James T.", type: "Student" },
   "L3": { name: "Lolin, Angeline M.", type: "Student" },
   "L4": { name: "Amongan, Shamille E.", type: "Student" },
   "S1": { name: "Jordan Reyes", type: "Staff" }
 };
 
+
+const patrons = new Map(Object.entries(directory));
+
 const emptyState = { staff: null, visits: [], log: [] };
 let state = readState();
 
+
 function readState() {
   try {
-    return { ...emptyState, ...JSON.parse(sessionStorage.getItem("libraryVisitDesk")) };
+    const saved = JSON.parse(localStorage.getItem("libraryVisitDesk")) || {};
+    return {
+      staff: saved.staff ?? null,
+      visits: new Map((saved.visits || []).map((v) => [v.id, v])),
+      log: saved.log || []
+    };
   } catch {
-    return { ...emptyState };
+    return { staff: null, visits: new Map(), log: [] };
   }
 }
 
-function saveState() { sessionStorage.setItem("libraryVisitDesk", JSON.stringify(state)); }
-function normaliseId(value) { return value.trim().toUpperCase(); }
+
+function saveState() {
+  localStorage.setItem("libraryVisitDesk", JSON.stringify({ ...state, visits: [...state.visits.values()] }));
+}
+function normaliseId(value) {
+  return String(value ?? "").replace(/\s+/g, "").toUpperCase();
+}
 function currentTime() { return new Intl.DateTimeFormat(undefined, { hour: "numeric", minute: "2-digit" }).format(new Date()); }
 function today() { return new Intl.DateTimeFormat(undefined, { weekday: "long", month: "long", day: "numeric", year: "numeric" }).format(new Date()); }
+
+function nowISO() { return new Date().toISOString(); }
+
+function formatTime(iso) {
+  const d = new Date(iso);
+  if (isNaN(d)) return iso;
+  return new Intl.DateTimeFormat("en-PH", { timeZone: "Asia/Manila", hour: "numeric", minute: "2-digit" }).format(d);
+} 
 function goTo(page) { window.location.href = page; }
 
 function showScanResult(result) {
@@ -38,29 +60,137 @@ function showScanResult(result) {
   window.requestAnimationFrame(() => input.focus());
 }
 
-function addLog(action, visit) {
-  state.log.push({ time: currentTime(), action, id: visit.id, name: visit.name, staff: state.staff?.id || "Staff" });
+function addLog(action, visit, by) {
+  state.log.push({
+    time: nowISO(), action, id: visit.id, name: visit.name,
+    staff: by || state.staff?.id || "Staff",
+    checkinTime: visit.checkinTime, type: visit.type
+  });
 }
 
-function processVisit(id) {
-  const person = directory[id];
-  if (!person) {
-    showScanResult({ success: false, eyebrow: "ID needs attention", title: "Unregistered ID", message: "This ID is not in the approved visitor directory. Follow your library’s visitor-registration process rather than creating a record here." });
+
+function forceCheckOut(id) {
+  const visit = state.visits.get(id);
+  if (!visit) return;
+  if (!confirm(`Force check-out ${visit.name}?`)) return;
+  state.visits.delete(id);
+  addLog("Force checked out", visit);
+  saveState();
+  renderDashboard();
+  renderActiveTable();
+}
+
+
+const CLOSING_HOUR = 20;
+
+
+function manilaParts(date) {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Manila", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", hourCycle: "h23"
+  }).formatToParts(date);
+  const get = (type) => parts.find((p) => p.type === type).value;
+  return { day: `${get("year")}-${get("month")}-${get("day")}`, hour: Number(get("hour")) };
+}
+
+
+function isStale(visit) {
+  const checkedIn = new Date(visit.checkinTime);
+  if (isNaN(checkedIn)) return true; 
+  const then = manilaParts(checkedIn);
+  const now = manilaParts(new Date());
+  if (now.day > then.day) return true; 
+  return now.hour >= CLOSING_HOUR && then.hour < CLOSING_HOUR; 
+}
+
+
+function autoCloseVisits() {
+  let closed = 0;
+  for (const [id, visit] of state.visits) {
+    if (isStale(visit)) {
+      state.visits.delete(id);
+      addLog("Auto checked out", visit, "SYSTEM");
+      closed++;
+    }
+  }
+  if (closed > 0) saveState();
+  return closed;
+}
+
+function undoLastEntry() {
+  const last = state.log[state.log.length - 1];
+
+  if (!last || last.action.startsWith("Correction")) {
+    showScanResult({
+      success: false,
+      eyebrow: "Nothing to undo",
+      title: "No entry to undo",
+      message: "There is no recent entry to reverse, or the last entry is already a correction."
+    });
     return;
   }
-  const activeIndex = state.visits.findIndex((visit) => visit.id === id);
-  if (activeIndex >= 0) {
-    const [visit] = state.visits.splice(activeIndex, 1);
+
+  if (!confirm(`Undo "${last.action}" for ${last.name}?`)) return;
+
+  const visit = { id: last.id, name: last.name, type: last.type, checkinTime: last.checkinTime || nowISO() };
+  let label;
+
+  if (last.action === "Checked in") {
+    state.visits.delete(last.id);
+    label = "Correction: check-in undone";
+  } else {
+    state.visits.set(last.id, visit);
+    label = "Correction: check-out undone";
+  }
+
+  addLog(label, visit);
+  delete lastScan[last.id];
+  saveState();
+  showScanResult({
+    success: true,
+    eyebrow: "Correction recorded",
+    title: "Last entry undone",
+    message: `${last.name}: "${last.action}" was reversed. The correction was added to Report / Logs.`
+  });
+}
+
+
+function processVisit(id) {
+  const person = patrons.get(id);
+
+  if (!person) {
+    showScanResult({
+      success: false,
+      eyebrow: "ID needs attention",
+      title: "Unregistered ID",
+      message: "This ID is not in the approved visitor directory. Follow your library's visitor-registration process rather than creating a record here."
+    });
+    return;
+  }
+
+  if (state.visits.has(id)) {
+    const visit = state.visits.get(id);
+    state.visits.delete(id);
     addLog("Checked out", visit);
     saveState();
-    showScanResult({ success: true, eyebrow: "Auto-detected: check-out", title: "Check-out recorded", message: `${visit.name} was checked out at ${currentTime()}. The event was added to today’s Report / Logs. Ready for the next scan.` });
+    showScanResult({
+      success: true,
+      eyebrow: "Auto-detected: check-out",
+      title: "Check-out recorded",
+      message: `${visit.name} was checked out at ${formatTime(nowISO())}. The event was added to today's Report / Logs. Ready for the next scan.`
+    });
     return;
   }
-  const visit = { id, name: person.name, type: person.type, checkinTime: currentTime() };
-  state.visits.push(visit);
+
+  const visit = { id, name: person.name, type: person.type, checkinTime: nowISO() };
+  state.visits.set(id, visit);
   addLog("Checked in", visit);
   saveState();
-  showScanResult({ success: true, eyebrow: "Auto-detected: check-in", title: "Check-in recorded", message: `${visit.name} checked in at ${visit.checkinTime}. Their visit is now visible in the Currently-In List. Ready for the next scan.` });
+  showScanResult({
+    success: true,
+    eyebrow: "Auto-detected: check-in",
+    title: "Check-in recorded",
+    message: `${visit.name} checked in at ${formatTime(visit.checkinTime)}. Their visit is now visible in the Currently-In List. Ready for the next scan.`
+  });
 }
 
 function setupHeader() {
@@ -73,7 +203,7 @@ function setupHeader() {
   if (logoutButton && state.staff) {
     logoutButton.hidden = false;
     logoutButton.addEventListener("click", () => {
-      state = { ...emptyState };
+            state.staff = null;
       saveState();
       goTo("welcome.html");
     });
@@ -88,13 +218,24 @@ function requireSession() {
   return true;
 }
 
+function addRow(tbody, values) {
+  const row = document.createElement("tr");
+  values.forEach((value) => {
+    const td = document.createElement("td");
+    td.textContent = value;
+    row.append(td);
+  });
+  tbody.append(row);
+}
+
 function renderDashboard() {
   const count = document.querySelector("#active-count");
   const date = document.querySelector("#dashboard-date");
-  if (count) count.textContent = state.visits.length;
+  if (count) count.textContent = state.visits.size;
   if (date) date.textContent = today();
 }
 
+// Render the Currently-In List. One pass over the Map: O(v) for v active visits.
 function renderActiveTable() {
   const tbody = document.querySelector("#active-table-body");
   const empty = document.querySelector("#active-empty");
@@ -102,12 +243,20 @@ function renderActiveTable() {
   if (!tbody) return;
   tbody.innerHTML = "";
   state.visits.forEach((visit) => {
-    const row = document.createElement("tr");
-    row.innerHTML = `<td>${visit.id}</td><td>${visit.name}</td><td>${visit.checkinTime}</td>`;
-    tbody.append(row);
+    addRow(tbody, [visit.id, visit.name, formatTime(visit.checkinTime)]);
+
+    const td = document.createElement("td");
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "button button-secondary";
+    btn.textContent = "Force check-out";
+    btn.addEventListener("click", () => forceCheckOut(visit.id));
+    td.append(btn);
+    tbody.lastElementChild.append(td);
   });
-  empty.hidden = state.visits.length !== 0;
-  description.textContent = `${state.visits.length} active ${state.visits.length === 1 ? "visitor" : "visitors"}. Check out through the Scan ID page.`;
+  const count = state.visits.size;
+  empty.hidden = count !== 0;
+  description.textContent = `${count} active ${count === 1 ? "visitor" : "visitors"}. Check out through the Scan ID page.`;
 }
 
 function renderLogTable() {
@@ -115,11 +264,7 @@ function renderLogTable() {
   const empty = document.querySelector("#logs-empty");
   if (!tbody) return;
   tbody.innerHTML = "";
-  [...state.log].reverse().forEach((event) => {
-    const row = document.createElement("tr");
-    row.innerHTML = `<td>${event.time}</td><td>${event.action}</td><td>${event.id}</td><td>${event.name}</td><td>${event.staff}</td>`;
-    tbody.append(row);
-  });
+      [...state.log].reverse().forEach((e) => addRow(tbody, [formatTime(e.time), e.action, e.id, e.name, e.staff]));
   empty.hidden = state.log.length !== 0;
 }
 
@@ -142,15 +287,44 @@ function setupLogin() {
   });
 }
 
+const lastScan = {};
+const SCAN_COOLDOWN_MS = 3000;
+
 function setupScan() {
   const form = document.querySelector("#scan-form");
   if (!form) return;
   form.addEventListener("submit", (event) => {
     event.preventDefault();
-    const id = normaliseId(new FormData(form).get("visitorId"));
     const error = document.querySelector("#scan-error");
+    const result = document.querySelector("#scan-result");
+    error.hidden = true;
+    result.hidden = true;
+
+    const id = normaliseId(new FormData(form).get("visitorId"));
     if (!id) { error.hidden = false; return; }
+
+    const now = Date.now();
+    if (lastScan[id] && now - lastScan[id] < SCAN_COOLDOWN_MS) {
+      showScanResult({
+        success: false,
+        eyebrow: "Duplicate scan",
+        title: "Scanned too quickly",
+        message: "This ID was just processed. Wait a few seconds before scanning it again."
+      });
+      return;
+    }
+    lastScan[id] = now;
     processVisit(id);
+  });
+}
+
+
+function setupUndo() {
+  const button = document.querySelector("#undo-button");
+  if (!button) return;
+  button.addEventListener("click", () => {
+    document.querySelector("#scan-error").hidden = true;
+    undoLastEntry();
   });
 }
 
@@ -158,7 +332,17 @@ if (requireSession()) {
   setupHeader();
   setupLogin();
   setupScan();
+  setupUndo();
+  autoCloseVisits();
   renderDashboard();
   renderActiveTable();
   renderLogTable();
+
+  setInterval(() => {
+    if (autoCloseVisits() > 0) {
+      renderDashboard();
+      renderActiveTable();
+      renderLogTable();
+    }
+  }, 60000);
 }
